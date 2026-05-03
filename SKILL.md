@@ -1,142 +1,151 @@
 ---
-name: 公众号数据
-description: 抓取微信公众号全量文章数据并生成可视化 HTML 分析报告（支持任意公众号，需登录对应后台）
-trigger: /公众号数据
+name: 抓订阅公众号
+description: 抓取目标微信公众号的全量历史文章（标题/链接/发布时间/摘要/全文/图片），转存为本地 Markdown 归档。需登录自己的公众号后台（用其超链接接口搜索目标号）。
+trigger: /抓订阅公众号
 ---
 
-# 公众号数据 Skill
+# 抓订阅公众号 Skill
 
-抓取 mp.weixin.qq.com 发表记录页的全量文章数据，生成包含互动率、阅读分布、内容类型 ROI 等深度分析的可视化 HTML 报告。支持任意公众号，只需在 Chrome 中登录对应后台即可。
+通过登录自己的公众号后台 mp.weixin.qq.com，调用其内置的"超链接 → 引用其他公众号文章"接口，搜索目标公众号、拉取全量历史文章列表，再逐篇下载全文 HTML，解析为 Markdown 并下载图片到本地。
+
+适用场景：行业研究 / 内容收藏 / 离线归档 (≤ 10 个目标号)。
+不适用场景：抓取阅读量、点赞、在看（这些数据微信只对号主开放，需走逆向抓包或第三方付费 API）。
 
 ## 前置条件
 
 ```bash
-pip install playwright && playwright install chromium
+pip3 install playwright requests beautifulsoup4 markdownify lxml
+playwright install chromium
 ```
 
-首次运行会弹出浏览器窗口，用微信扫码登录公众号后台。登录态自动保存在 `~/.mp-data-browser/`，后续无需重复扫码。
+**你必须有自己的微信公众号**（订阅号免费注册即可），首次运行会弹出浏览器，用微信扫码登录到 mp.weixin.qq.com。登录态保存在 `~/.mp-data-browser/`。
 
 ## 使用方式
 
+```bash
+/抓订阅公众号 "极客公园"                       # 抓单个号的全量历史
+/抓订阅公众号 "极客公园" --since 2025-01-01    # 只抓某日期之后的文章（增量）
+/抓订阅公众号 --add "极客公园"                 # 添加目标号到配置（不抓取）
+/抓订阅公众号 --list                          # 列出已配置的目标号
+/抓订阅公众号 --all                           # 抓配置里所有号（自动跳过已抓的）
 ```
-/公众号数据                          # 全量抓取 + HTML 分析报告
-/公众号数据 --quick                  # 只跑分析（用已有 /tmp/mp_all_publish_data.json）
-/公众号数据 --content                # 抓取文章正文内容
-/公众号数据 --content --top 20       # 只抓阅读量前20篇的正文
+
+## 输出结构
+
+```
+~/wechat-archive/
+├── <公众号A>/
+│   ├── INDEX.md                              # 索引（按时间倒序，可点击跳转）
+│   ├── 2025-04-20_文章标题/
+│   │   ├── article.md                        # 正文 Markdown
+│   │   ├── metadata.json                     # 元数据（链接、发布时间、摘要等）
+│   │   └── images/
+│   │       ├── 01.jpg
+│   │       └── 02.jpg
+│   └── 2025-04-15_另一篇标题/
+│       └── ...
+└── <公众号B>/...
 ```
 
 ## 执行流程
 
-### Step 1: 检查是否需要抓取
+### Step 1: 解析参数
 
-- `--quick` 模式：跳到 Step 5，直接用已有数据生成报告
-- 默认模式：先检查/完成登录，再全量抓取
+读取 `--add / --list / --all / --since` 等开关，决定执行路径。
 
-### Step 2: 登录公众号后台
-
-脚本自动处理登录流程：
+### Step 2: 登录到自己的公众号后台
 
 ```bash
-python3 ~/.claude/skills/mp-data/scripts/scrape.py
+python3 ~/.claude/skills/mp-data/scripts/scrape.py "<目标公众号名>" [--since YYYY-MM-DD]
 ```
 
-1. 打开 mp.weixin.qq.com，检测是否已有登录态
-2. 如果已登录：自动提取 token，显示当前公众号名称
-3. 如果未登录：Chrome 会显示扫码页面，提示用户用微信扫码
-4. 等待扫码完成（最长 3 分钟），自动提取 token
+1. Playwright 启动 Chromium，加载 `~/.mp-data-browser/` 持久化用户目录
+2. 打开 `https://mp.weixin.qq.com/`
+3. 已登录 → 自动提取 token；未登录 → 等待扫码（最长 3 分钟）
 
-**无需手动复制 token**，脚本从页面 URL 自动提取。
+### Step 3: 搜索目标公众号 → 拿 fakeid
 
-### Step 3: 获取总页数
-
-在发表记录页执行 JS 提取总文章数：
-
-```javascript
-var total = document.querySelector('.weui-desktop-pagination__num') || 
-            document.querySelector('[class*=total]');
-total ? total.innerText : 'unknown';
+调用接口：
+```
+GET https://mp.weixin.qq.com/cgi-bin/searchbiz
+    ?action=search_biz&begin=0&count=5&query=<目标名>
+    &token=<token>&lang=zh_CN&f=json&ajax=1
 ```
 
-计算总页数 = Math.ceil(总数 / 10)
+返回候选列表，自动取第一个匹配的 `fakeid`。如果有多个同名号，会列出让用户确认。
 
-### Step 4: 逐页抓取
+### Step 4: 分页拉取文章列表
 
-对每一页（begin=0, 10, 20, ...）：
-1. `opencli browser open` 导航到对应页
-2. 等待 4 秒加载
-3. `opencli browser eval` 执行提取脚本 `scripts/extract.js`
-4. 解析 JSON 结果，追加到文章列表
+```
+GET https://mp.weixin.qq.com/cgi-bin/appmsg
+    ?action=list_ex&begin=<begin>&count=5&fakeid=<fakeid>&type=9
+    &query=&token=<token>&lang=zh_CN&f=json&ajax=1
+```
 
-抓取完成后保存到 `/tmp/mp_all_publish_data.json`。
+每页返回 5 篇，循环直到 `app_msg_list` 为空或 `--since` 截止日期之前。
 
-### Step 5: 生成 HTML 分析报告
+每篇包含：`aid` / `title` / `link` / `digest` / `cover` / `create_time` / `update_time`。
+
+**频率限制**：mp 后台对 `appmsg` 接口有约 100 次/小时的限制，触发后脚本会等待 60 秒重试。
+
+列表保存到 `~/wechat-archive/<公众号>/_list.json`。
+
+### Step 5: 逐篇下载全文
 
 ```bash
-python3 ~/.claude/skills/mp-data/scripts/report_html.py /tmp/mp_report.html
-open /tmp/mp_report.html
+python3 ~/.claude/skills/mp-data/scripts/download_full.py "<公众号名>"
 ```
 
-报告内容包括：
+对 `_list.json` 中每篇文章：
+1. 检查目录是否已存在 → 已存在则跳过（增量友好）
+2. `requests.get(link)` 拉公开 HTML（不需要登录）
+3. BeautifulSoup 解析 `#js_content`
+4. markdownify 转为 Markdown
+5. 提取所有 `img[data-src]` 图片，下载到 `images/`
+6. 替换 Markdown 里的图片引用为本地相对路径
+7. 写 `article.md` + `metadata.json`
 
-**顶部 KPI**：总篇数、总阅读、篇均阅读、中位数阅读、赞阅比、在看阅比、分享率、综合互动率
+**频率限制**：每篇间隔 2 秒，避免触发反爬。
 
-**阅读量分布特征**：均值/中位数/标准差/变异系数/四分位数/P90 头部线/前 20% 贡献度 + 阅读量直方图
-
-**4 个趋势图表**：
-- 月度总阅读（柱状图）
-- 篇均 vs 中位数 / 发文量（折线+柱状复合图）
-- 月度互动率趋势（赞阅比/在看率/分享率/综合互动率四线）
-- 内容类型篇均阅读（横向柱状图）
-
-**5 个数据表格**：
-- TOP 20 文章（按阅读量）：含赞阅比、在看率、分享率、互动率
-- TOP 20 文章（按互动率）：发现读者真正认可的内容
-- 月度汇总：含中位数、各互动比率
-- 内容类型深度分析：各类型的互动行为差异和阅读占比
-- 高分享率文章（>15%，阅读>100）
-- 高潜力文章（高互动低阅读，值得二次推广）
-
-**底部指标说明**：每个指标的含义和公众号典型参考值
-
-### Step 6: 获取文章内容（--content 模式）
-
-通过 CDP 浏览器打开每篇文章 URL，提取正文文本。
+### Step 6: 生成索引
 
 ```bash
-# 单篇
-python3 ~/.claude/skills/mp-data/scripts/fetch_content.py "文章URL"
-
-# 批量（用已有数据）
-python3 ~/.claude/skills/mp-data/scripts/fetch_content.py --batch /tmp/mp_all_publish_data.json
-
-# 只取阅读量前20篇
-python3 ~/.claude/skills/mp-data/scripts/fetch_content.py --batch /tmp/mp_all_publish_data.json --top 20
+python3 ~/.claude/skills/mp-data/scripts/build_index.py "<公众号名>"
 ```
 
-前置条件：CDP Proxy 已启动（`localhost:3456`）。
-
-提取内容包括：标题、作者、发布时间、正文文本、图片URL列表、字数统计。
-输出保存到 `/tmp/mp_articles_content.json`。
-
-### Step 7: 数据存储
-
-- JSON 数据 → `/tmp/mp_all_publish_data.json`（全量，供后续分析复用）
-- HTML 报告 → `/tmp/mp_report.html`（浏览器直接打开）
-- 文章内容 → `/tmp/mp_articles_content.json`（正文提取结果）
-- 如需归档到 Vault → `{VAULT}/10.项目/公众号/6.数据复盘/` 下
+读取该公众号目录下所有 `metadata.json`，按发布时间倒序生成 `INDEX.md`，每条包含：
+- 标题（点击跳转到 `article.md`）
+- 发布日期
+- 摘要前 100 字
 
 ## 故障排除
 
-- **扫码超时**：重新运行，Chrome 会再次显示扫码页面
-- **token 失效**：关闭 Chrome 中已打开的 mp.weixin.qq.com 页面，重新运行让脚本自动获取新 token
-- **opencli 不可用**：确认 `opencli browser` 命令可正常执行
+- **扫码超时**：重新运行命令
+- **token 失效**：删除 `~/.mp-data-browser/` 重新登录
+- **频率限制 (`freq control`)**：脚本自动等待重试，如频繁触发，建议第二天再跑
+- **搜索不到目标号**：mp 后台的搜索是模糊匹配，尝试更精确的名字或带备案号关键词
+- **某篇文章下载失败**：可能是该文章被作者删除或违规屏蔽，跳过即可
+- **图片下载失败**：微信图床偶有限流，重新跑该号会跳过已下载的、补抓失败的
 
 ## 文件结构
 
 ```
-scripts/
-├── extract.js       # 浏览器端 DOM 提取脚本（含文章 URL 抓取）
-├── scrape.py        # 全量翻页抓取脚本
-├── report_html.py   # HTML 可视化报告生成器
-└── fetch_content.py # 文章正文内容提取（CDP 浏览器）
+mp-data/
+├── SKILL.md
+├── scripts/
+│   ├── scrape.py          # 登录 + 搜索 + 拉文章列表
+│   ├── download_full.py   # 下载全文 HTML → Markdown + 图片
+│   ├── build_index.py     # 生成 INDEX.md
+│   └── config.py          # 配置管理（目标号列表）
+```
+
+## 配置文件
+
+`~/.config/抓订阅公众号/config.json`
+
+```json
+{
+  "targets": ["极客公园", "晚点LatePost"],
+  "archive_dir": "~/wechat-archive"
+}
 ```

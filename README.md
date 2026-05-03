@@ -1,56 +1,140 @@
-# 公众号数据 — Claude Code Skill
+# 抓订阅公众号 — Claude Code Skill
 
-抓取微信公众号全量文章数据，生成包含互动率、阅读分布、内容类型分析等深度洞察的可视化 HTML 报告。
+抓取你**订阅的他人微信公众号**的全量历史文章（标题、链接、发布时间、摘要、全文、图片），自动转存为本地 Markdown 归档。
 
-支持任意公众号，只需微信扫码登录对应后台即可。
+适用场景：行业研究 / 内容收藏 / 离线阅读 / 个人知识库（≤ 10 个目标号）
+
+> **不要混淆**：本工具抓的是 **别人** 运营的公众号，**不是** 你自己运营的公众号后台数据。原项目（fork 来源）是抓自己运营号的运营 KPI。
+
+---
 
 ## 安装
 
-把下面这句话复制粘贴到 Claude Code 里，它会自动完成所有安装：
+```bash
+# 1. clone
+git clone https://github.com/lucyliufromchina-cpu/wechat-subscription-archive.git
+cd wechat-subscription-archive
 
-> 帮我安装公众号数据分析 skill：从 https://github.com/Larkin0302/mp-data clone 下来，安装 playwright 和 chromium 依赖
+# 2. 装依赖
+pip3 install playwright requests beautifulsoup4 markdownify lxml
+playwright install chromium
 
-<details>
-<summary>或者手动安装</summary>
+# 3. 装到 Claude Code skills 目录（软链方式，方便后续改造）
+ln -sf "$(pwd)" ~/.claude/skills/抓订阅公众号
+```
+
+或者直接复制粘贴到 Claude Code 里：
+
+> 帮我安装抓订阅公众号 skill：从 https://github.com/lucyliufromchina-cpu/wechat-subscription-archive clone 下来，安装 playwright + chromium + requests + beautifulsoup4 + markdownify + lxml 依赖，然后软链到 `~/.claude/skills/抓订阅公众号`
+
+---
+
+## 前置条件
+
+**你必须有自己的微信公众号**（订阅号免费注册即可）。这个工具会通过你后台的"超链接 → 引用其他公众号文章"接口去搜索目标公众号、拉取它的全量历史文章列表。
+
+不需要订阅号也不要紧，注册一个空号也能用，全程不会用你的号发任何内容。
+
+---
+
+## 使用方式
 
 ```bash
-git clone https://github.com/Larkin0302/mp-data.git
-pip install playwright && playwright install chromium
+# 在 Claude Code 中
+/抓订阅公众号 "极客公园"                       # 抓单个号的全量历史
+/抓订阅公众号 "极客公园" --since 2025-01-01    # 增量
+/抓订阅公众号 --add "极客公园"                 # 添加到目标列表（不抓取）
+/抓订阅公众号 --list                          # 列出已配置的目标号
+/抓订阅公众号 --all                           # 抓配置里所有号
+
+# 或直接命令行
+python3 scripts/scrape.py "极客公园" --since 2025-04-01
+python3 scripts/download_full.py "极客公园"
+python3 scripts/build_index.py "极客公园"
 ```
-</details>
 
-## 使用
+首次运行会弹出浏览器，用微信扫码登录 mp.weixin.qq.com 后台。登录态保存在 `~/.mp-data-browser/`，后续无需重复扫码。
 
-在 Claude Code 中：
+---
+
+## 输出结构
 
 ```
-/公众号数据                    # 全量抓取 + HTML 分析报告
-/公众号数据 --quick            # 用已有数据直接生成报告
+~/wechat-archive/
+├── <公众号A>/
+│   ├── INDEX.md                              # 索引（按月分组、时间倒序、可点击）
+│   ├── 2025-04-20_文章标题/
+│   │   ├── article.md                        # 正文 Markdown（带 frontmatter）
+│   │   ├── metadata.json                     # 元数据（链接、发布时间、摘要等）
+│   │   └── images/
+│   │       ├── 01.jpg
+│   │       └── 02.jpg
+│   └── 2025-04-15_另一篇标题/
+│       └── ...
+└── <公众号B>/...
 ```
 
-首次运行会弹出浏览器窗口，用微信扫码登录公众号后台。登录态自动保存，后续无需重复扫码。
+推荐用 [Typora](https://typora.io) / [Obsidian](https://obsidian.md) / VSCode 打开 `~/wechat-archive/<公众号>/` 目录，体验最好（图片本地化、链接可跳转）。
 
-## 报告内容
-
-- **KPI 概览**：总篇数、总阅读、篇均阅读、中位数、互动率
-- **阅读量分布**：直方图 + 统计特征（均值/中位数/标准差/P90）
-- **趋势图表**：月度阅读、发文量、互动率趋势、内容类型对比
-- **数据表格**：TOP 20 文章（按阅读量/互动率）、月度汇总、高潜力文章
+---
 
 ## 工作原理
 
-1. 通过 Playwright 驱动 Chromium 浏览器
-2. 打开 mp.weixin.qq.com 公众号后台
-3. 自动检测登录态，未登录则等待扫码
-4. 逐页抓取"发表记录"页面的文章数据
-5. 生成带图表的 HTML 分析报告
+1. 通过 Playwright 启动 Chromium，登录 mp.weixin.qq.com 后台
+2. 调用 `cgi-bin/searchbiz` 接口搜索目标公众号 → 拿 `fakeid`
+3. 分页调用 `cgi-bin/appmsg` 接口拉文章列表（标题 / 链接 / 发布时间 / 摘要 / 封面）
+4. 用 `requests` 拉每篇文章的公开 HTML 页（公众号文章是公开内容）
+5. BeautifulSoup 解析 `#js_content`，markdownify 转 Markdown
+6. 下载文章里所有图片到本地，替换正文里的图片路径
+
+---
+
+## 不能做什么 / 已知限制
+
+- **拿不到阅读量、点赞、在看**：这些数据微信只对号主开放，需要走逆向抓包或第三方付费 API（新榜、清博等）
+- **mp 后台接口有日额度**：约几百次/日，触发频控会自动指数退避（60s → 3min → 10min → 20min → 1h），最多 5 次
+- **被作者删除/违规屏蔽的文章**：抓不到，会标记为 fail
+- **不会抓你自己运营号的运营数据**：那是原项目（[Larkin0302/mp-data](https://github.com/Larkin0302/mp-data)）的功能
+
+---
 
 ## 文件结构
 
 ```
-├── SKILL.md              # Claude Code skill 定义
+.
+├── SKILL.md                  # Claude Code skill 定义
 ├── scripts/
-│   ├── extract.js        # 浏览器端 DOM 数据提取
-│   ├── scrape.py         # Playwright 驱动的全量抓取
-│   └── report_html.py    # HTML 可视化报告生成
+│   ├── test_login.py         # 登录测试（独立验证扫码登录）
+│   ├── scrape.py             # 搜索公众号 + 拉文章列表
+│   ├── download_full.py      # 下载全文 + 图片，转 Markdown
+│   ├── build_index.py        # 生成 INDEX.md
+│   └── config.py             # 配置管理（目标号列表）
+└── README.md
 ```
+
+---
+
+## 致谢
+
+本项目 fork 自 [Larkin0302/mp-data](https://github.com/Larkin0302/mp-data)。
+
+原项目用于抓取**自己运营的公众号**后台运营数据（阅读量、互动率等 KPI），生成 HTML 数据看板。
+
+本 fork 在原项目基础上重写了核心逻辑，转向另一个使用场景：**抓取自己订阅的他人公众号文章**，输出 Markdown 归档供个人研究和阅读。
+
+复用了原项目的：
+- Playwright + 持久化登录态架构
+- mp.weixin.qq.com 扫码登录流程
+
+重写的部分：
+- 抓取目标：自己的发表记录页 → 别人的全量文章列表（searchbiz + appmsg API）
+- 输出形式：HTML 数据看板 → 按月分组的 Markdown 归档 + 图片本地化
+- 新增：增量抓取、目标号配置管理、INDEX 自动索引
+
+感谢 [@Larkin0302](https://github.com/Larkin0302) 提供的优秀基础。
+
+---
+
+## License
+
+MIT

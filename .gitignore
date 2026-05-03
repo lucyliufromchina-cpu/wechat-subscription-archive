@@ -1,5 +1,37 @@
 __pycache__/
 *.pyc
+*.pyo
+.DS_Store
+
+# 旧版本残留（不再使用）
 audit.jsonl
 _lark_tmp.json
 _bitable_patch.json
+
+# === 防止误提交敏感数据（运行时数据本来就在 home 目录，加这里是双保险） ===
+
+# Playwright 浏览器持久化目录（含 mp 后台登录态 cookie）
+.mp-data-browser/
+mp-data-browser/
+
+# 配置文件（含目标号列表，可能含个人偏好）
+.config/
+config.json
+
+# 抓取到的公众号内容（可能涉及他人版权）
+wechat-archive/
+_list.json
+*/metadata.json
+*/article.md
+*/images/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+.env
+.env.local
+
+# 测试/调试输出
+/tmp_output/
+*.log
