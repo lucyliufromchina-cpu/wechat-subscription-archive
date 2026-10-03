@@ -1,39 +1,39 @@
 # 抓订阅公众号 — Claude Code Skill
 
-抓取你**订阅的他人微信公众号**的全量历史文章（标题、链接、发布时间、摘要、全文、图片），自动转存为本地 Markdown 归档。
+按主题抓取你**订阅的他人微信公众号**的历史文章（标题、链接、发布时间、全文、图片），转存为本地 Markdown 归档。
 
-适用场景：行业研究 / 内容收藏 / 离线阅读 / 个人知识库（≤ 10 个目标号）
+适用场景：行业研究 / 内容收藏 / 离线阅读 / 个人知识库
 
 > **不要混淆**：本工具抓的是 **别人** 运营的公众号，**不是** 你自己运营的公众号后台数据。原项目（fork 来源）是抓自己运营号的运营 KPI。
+
+---
+
+## ⚠️ 2026-08 更新：方法已更换
+
+**2026-07-30 起，微信关闭了公众号后台「超链接 → 引用其他公众号文章」背后的接口**：拉文章列表恒返回 `200013 freq control`，后台编辑器里的入口也已消失（订阅号、已认证服务号实测均如此）。同类最大的开源项目 [wechat-article-exporter](https://github.com/wechat-article/wechat-article-exporter/issues/200) 已因此停止维护。微信读书网页端的文章列表接口也已废弃，只能拿到最新一篇。
+
+本 skill 现改用 **搜狗微信搜索「公众号名 + 主题关键词」**：
+
+| 搜索方式 | 实测命中率 |
+| --- | --- |
+| 只搜公众号名 | 约 1%（搜的是正文提及，账号自己的文章被转载、引用淹没） |
+| 公众号名 + 主题词 | 接近 100% |
+
+代价：不能一次拉"全部"文章，要用一组关键词覆盖（每个查询最多 10 页 ≈ 100 条）；搜狗有防爬，需要慢速采集。
+
+老脚本（`scrape.py` / `download_full.py` / `test_login.py`）保留作存档。
 
 ---
 
 ## 安装
 
 ```bash
-# 1. clone
 git clone https://github.com/lucyliufromchina-cpu/wechat-subscription-archive.git
 cd wechat-subscription-archive
-
-# 2. 装依赖
-pip3 install playwright requests beautifulsoup4 markdownify lxml
-playwright install chromium
-
-# 3. 装到 Claude Code skills 目录（软链方式，方便后续改造）
 ln -sf "$(pwd)" ~/.claude/skills/抓订阅公众号
 ```
 
-或者直接复制粘贴到 Claude Code 里：
-
-> 帮我安装抓订阅公众号 skill：从 https://github.com/lucyliufromchina-cpu/wechat-subscription-archive clone 下来，安装 playwright + chromium + requests + beautifulsoup4 + markdownify + lxml 依赖，然后软链到 `~/.claude/skills/抓订阅公众号`
-
----
-
-## 前置条件
-
-**你必须有自己的微信公众号**（订阅号免费注册即可）。这个工具会通过你后台的"超链接 → 引用其他公众号文章"接口去搜索目标公众号、拉取它的全量历史文章列表。
-
-不需要订阅号也不要紧，注册一个空号也能用，全程不会用你的号发任何内容。
+**无第三方依赖**（Python 3.9+ 标准库），不需要公众号账号，不需要扫码。
 
 ---
 
@@ -41,19 +41,24 @@ ln -sf "$(pwd)" ~/.claude/skills/抓订阅公众号
 
 ```bash
 # 在 Claude Code 中
-/抓订阅公众号 "极客公园"                       # 抓单个号的全量历史
-/抓订阅公众号 "极客公园" --since 2025-01-01    # 增量
-/抓订阅公众号 --add "极客公园"                 # 添加到目标列表（不抓取）
-/抓订阅公众号 --list                          # 列出已配置的目标号
-/抓订阅公众号 --all                           # 抓配置里所有号
+/抓订阅公众号 "菜花来了" --keywords 税,股权,社保
 
 # 或直接命令行
-python3 scripts/scrape.py "极客公园" --since 2025-04-01
-python3 scripts/download_full.py "极客公园"
-python3 scripts/build_index.py "极客公园"
+python3 scripts/sogou_collect.py "菜花来了" --keywords 税,股权,社保 --max-requests 300
+python3 scripts/build_index.py "菜花来了"
 ```
 
-首次运行会弹出浏览器，用微信扫码登录 mp.weixin.qq.com 后台。登录态保存在 `~/.mp-data-browser/`，后续无需重复扫码。
+关键词建议：先放 1 个该号最常写的宽泛主题词，再加细分词；越靠前越优先。
+
+常用参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--keywords` | 必填 | 逗号分隔的主题词 |
+| `--max-requests` | 300 | 本次运行最多发多少次搜狗请求 |
+| `--cooldown` | 7200 | 遇到验证码后暂停秒数 |
+| `--max-cooldowns` | 3 | 本次运行最多暂停几次，超过即结束（重跑可续） |
+| `--no-images` | 关 | 不下载图片 |
 
 ---
 
@@ -61,40 +66,35 @@ python3 scripts/build_index.py "极客公园"
 
 ```
 ~/wechat-archive/
-├── <公众号A>/
-│   ├── INDEX.md                              # 索引（按月分组、时间倒序、可点击）
-│   ├── 2025-04-20_文章标题/
-│   │   ├── article.md                        # 正文 Markdown（带 frontmatter）
-│   │   ├── metadata.json                     # 元数据（链接、发布时间、摘要等）
-│   │   └── images/
-│   │       ├── 01.jpg
-│   │       └── 02.jpg
-│   └── 2025-04-15_另一篇标题/
-│       └── ...
-└── <公众号B>/...
+└── <公众号>/
+    ├── INDEX.md                      # 索引（按月分组、时间倒序、可点击）
+    ├── _sogou_state.sqlite           # 断点状态（已完成的页、已下载的文章）
+    └── 2025-04-20_文章标题/
+        ├── article.md                # 正文 Markdown（带 frontmatter，图片本地引用）
+        ├── metadata.json             # 标题、永久链接、发布时间、作者、命中关键词等
+        └── images/01.jpg ...
 ```
 
-推荐用 [Typora](https://typora.io) / [Obsidian](https://obsidian.md) / VSCode 打开 `~/wechat-archive/<公众号>/` 目录，体验最好（图片本地化、链接可跳转）。
+推荐用 [Obsidian](https://obsidian.md) / [Typora](https://typora.io) / VSCode 打开 `~/wechat-archive/<公众号>/`。
 
 ---
 
 ## 工作原理
 
-1. 通过 Playwright 启动 Chromium，登录 mp.weixin.qq.com 后台
-2. 调用 `cgi-bin/searchbiz` 接口搜索目标公众号 → 拿 `fakeid`
-3. 分页调用 `cgi-bin/appmsg` 接口拉文章列表（标题 / 链接 / 发布时间 / 摘要 / 封面）
-4. 用 `requests` 拉每篇文章的公开 HTML 页（公众号文章是公开内容）
-5. BeautifulSoup 解析 `#js_content`，markdownify 转 Markdown
-6. 下载文章里所有图片到本地，替换正文里的图片路径
+1. 搜狗微信文章搜索 `公众号名 关键词`，逐页解析结果，只保留署名与目标号完全一致的文章
+2. 还原搜狗跳转页中用 JS 拼接的真实文章链接（临时链接，立即使用）
+3. 下载公开的文章页，解析 `#js_content` 转 Markdown，图片下载到本地
+4. 从文章页取 `__biz / mid / idx / sn`，生成永久链接并去重（同一篇被多个关键词搜到只下载一次；老方法抓过的也会识别）
+5. 搜狗请求间隔 25–35 秒；遇到验证码暂停后重试，**不做任何验证码绕过**；可断点续跑
 
 ---
 
 ## 不能做什么 / 已知限制
 
-- **拿不到阅读量、点赞、在看**：这些数据微信只对号主开放，需要走逆向抓包或第三方付费 API（新榜、清博等）
-- **mp 后台接口有日额度**：约几百次/日，触发频控会自动指数退避（60s → 3min → 10min → 20min → 1h），最多 5 次
-- **被作者删除/违规屏蔽的文章**：抓不到，会标记为 fail
-- **不会抓你自己运营号的运营数据**：那是原项目（[Larkin0302/mp-data](https://github.com/Larkin0302/mp-data)）的功能
+- **拿不到某个号的完整文章列表**：只能按关键词覆盖
+- **拿不到阅读量、点赞、在看**：仅号主可见
+- **采集较慢**：一整套关键词通常要几小时，建议后台运行（`nohup caffeinate -i ...`）
+- **被作者删除 / 违规屏蔽的文章**：抓不到
 
 ---
 
@@ -104,11 +104,12 @@ python3 scripts/build_index.py "极客公园"
 .
 ├── SKILL.md                  # Claude Code skill 定义
 ├── scripts/
-│   ├── test_login.py         # 登录测试（独立验证扫码登录）
-│   ├── scrape.py             # 搜索公众号 + 拉文章列表
-│   ├── download_full.py      # 下载全文 + 图片，转 Markdown
+│   ├── sogou_collect.py      # 现行：搜狗「名字 + 关键词」采集
 │   ├── build_index.py        # 生成 INDEX.md
-│   └── config.py             # 配置管理（目标号列表）
+│   ├── config.py             # 归档目录配置
+│   ├── scrape.py             # 已失效（2026-07-30）：公众号后台引用接口
+│   ├── download_full.py      # 已失效：依赖 scrape.py 的文章列表
+│   └── test_login.py         # 已失效：后台扫码登录测试
 └── README.md
 ```
 
@@ -116,20 +117,7 @@ python3 scripts/build_index.py "极客公园"
 
 ## 致谢
 
-本项目 fork 自 [Larkin0302/mp-data](https://github.com/Larkin0302/mp-data)。
-
-原项目用于抓取**自己运营的公众号**后台运营数据（阅读量、互动率等 KPI），生成 HTML 数据看板。
-
-本 fork 在原项目基础上重写了核心逻辑，转向另一个使用场景：**抓取自己订阅的他人公众号文章**，输出 Markdown 归档供个人研究和阅读。
-
-复用了原项目的：
-- Playwright + 持久化登录态架构
-- mp.weixin.qq.com 扫码登录流程
-
-重写的部分：
-- 抓取目标：自己的发表记录页 → 别人的全量文章列表（searchbiz + appmsg API）
-- 输出形式：HTML 数据看板 → 按月分组的 Markdown 归档 + 图片本地化
-- 新增：增量抓取、目标号配置管理、INDEX 自动索引
+本项目 fork 自 [Larkin0302/mp-data](https://github.com/Larkin0302/mp-data)。原项目用于抓取**自己运营的公众号**后台运营数据（阅读量、互动率等 KPI），生成 HTML 数据看板。本 fork 转向另一个使用场景：**抓取自己订阅的他人公众号文章**，输出 Markdown 归档供个人研究和阅读。
 
 感谢 [@Larkin0302](https://github.com/Larkin0302) 提供的优秀基础。
 

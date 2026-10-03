@@ -114,27 +114,75 @@ def list_appmsg(page, token: str, fakeid: str, begin: int):
 FREQ_BACKOFF = [60, 180, 600, 1200, 3600]
 
 
-def fetch_all_articles(page, token: str, fakeid: str, since_ts: int = 0):
-    """分页拉全量文章。since_ts 之前的会停止。"""
+def fetch_all_articles(page, token: str, fakeid: str, since_ts: int = 0,
+                       checkpoint_path=None):
+    """分页拉全量文章。since_ts 之前的会停止。
+
+    checkpoint_path: 若提供，每 20 页写一次断点（{begin, articles}），
+    崩溃/频控中断后重跑可从断点续拉。
+    """
     all_items = []
     begin = 0
+    # 断点恢复
+    if checkpoint_path and checkpoint_path.exists():
+        try:
+            ck = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if ck.get("fakeid") == fakeid:
+                all_items = ck.get("articles", [])
+                begin = ck.get("begin", 0)
+                print(f"[i] 从断点续拉：已有 {len(all_items)} 篇，begin={begin}")
+        except Exception:
+            pass
+
+    def save_checkpoint():
+        if checkpoint_path:
+            checkpoint_path.write_text(json.dumps(
+                {"fakeid": fakeid, "begin": begin, "articles": all_items},
+                ensure_ascii=False), encoding="utf-8")
+
     freq_attempt = 0  # 当前 begin 的累计频控重试次数
+    nav_attempt = 0   # 当前 begin 的页面跳转崩溃重试次数
     while True:
-        data = list_appmsg(page, token, fakeid, begin)
+        try:
+            data = list_appmsg(page, token, fakeid, begin)
+        except Exception as e:
+            # 页面中途跳转导致 evaluate 上下文销毁：重载 mp 首页刷新会话后重试
+            if nav_attempt >= 3:
+                print(f"[X] 页面跳转错误重试 3 次仍失败：{e}")
+                print(f"    已抓取 {len(all_items)} 篇，断点已保存。")
+                save_checkpoint()
+                break
+            nav_attempt += 1
+            print(f"[!] 页面上下文丢失（{type(e).__name__}），重载 mp 首页后重试 (第 {nav_attempt}/3 次)...")
+            save_checkpoint()
+            try:
+                page.goto("https://mp.weixin.qq.com/", wait_until="domcontentloaded")
+                page.wait_for_timeout(5000)
+                new_token = extract_token(page.url)
+                if new_token:
+                    token = new_token
+                    print(f"[i] token 已刷新。")
+            except Exception as e2:
+                print(f"[!] 重载首页失败：{e2}")
+            time.sleep(10)
+            continue
+        nav_attempt = 0
         base_resp = data.get("base_resp", {})
         ret = base_resp.get("ret")
 
         # 致命错误：登录失效 / 会话失效，无法重试
         if ret in (200002, 200003):
             print(f"[X] 登录/会话已失效 (ret={ret})，请删除 ~/.mp-data-browser 后重新扫码登录。")
-            print(f"    已抓取 {len(all_items)} 篇，将这部分保存。")
+            print(f"    已抓取 {len(all_items)} 篇，将这部分保存（断点已写）。")
+            save_checkpoint()
             break
 
         # 频控：指数退避重试
         if ret == 200013:
             if freq_attempt >= len(FREQ_BACKOFF):
                 print(f"[X] 频控重试 {freq_attempt} 次仍失败，今日额度已用尽。")
-                print(f"    已抓取 {len(all_items)} 篇，将这部分保存。建议明天用 --since 增量补抓。")
+                print(f"    已抓取 {len(all_items)} 篇，将这部分保存（断点已写）。建议明天重跑同一命令从断点续拉。")
+                save_checkpoint()
                 break
             wait = FREQ_BACKOFF[freq_attempt]
             freq_attempt += 1
@@ -154,6 +202,8 @@ def fetch_all_articles(page, token: str, fakeid: str, since_ts: int = 0):
         total = data.get("app_msg_cnt", -1)
         if not items:
             print(f"[i] 已到末尾（begin={begin}），共 {len(all_items)} 篇。")
+            if checkpoint_path and checkpoint_path.exists():
+                checkpoint_path.unlink()  # 完整拉取，清理断点
             break
 
         # 截断：since
@@ -162,12 +212,16 @@ def fetch_all_articles(page, token: str, fakeid: str, since_ts: int = 0):
             all_items.extend(items_kept)
             if len(items_kept) < len(items):
                 print(f"[i] 抵达 --since 截止时间，提前停止。共 {len(all_items)} 篇。")
+                if checkpoint_path and checkpoint_path.exists():
+                    checkpoint_path.unlink()  # 完整拉取，清理断点
                 break
         else:
             all_items.extend(items)
 
         print(f"  ...已拉取 {len(all_items)}/{total if total > 0 else '?'} 篇")
         begin += 5
+        if checkpoint_path and (begin // 5) % 20 == 0:
+            save_checkpoint()
         time.sleep(2)  # 礼貌间隔
     return all_items
 
@@ -249,7 +303,11 @@ def main():
         nickname = target["nickname"]
 
         print(f"\n开始拉取文章列表...")
-        articles = fetch_all_articles(page, token, fakeid, since_ts)
+        archive_dir = get_archive_dir() / nickname
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = archive_dir / "_list.partial.json"
+        articles = fetch_all_articles(page, token, fakeid, since_ts,
+                                      checkpoint_path=checkpoint_path)
 
         ctx.close()
 

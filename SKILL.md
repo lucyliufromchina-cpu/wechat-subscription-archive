@@ -1,131 +1,92 @@
 ---
 name: 抓订阅公众号
-description: 抓取目标微信公众号的全量历史文章（标题/链接/发布时间/摘要/全文/图片），转存为本地 Markdown 归档。需登录自己的公众号后台（用其超链接接口搜索目标号）。
+description: 抓取目标微信公众号的历史文章（标题/链接/发布时间/全文/图片），转存为本地 Markdown 归档。2026-08 起改用搜狗微信搜索「公众号名 + 主题关键词」（微信已关闭公众号后台的引用接口）；不需要登录，只用 Python 标准库。
 trigger: /抓订阅公众号
 ---
 
 # 抓订阅公众号 Skill
 
-通过登录自己的公众号后台 mp.weixin.qq.com，调用其内置的"超链接 → 引用其他公众号文章"接口，搜索目标公众号、拉取全量历史文章列表，再逐篇下载全文 HTML，解析为 Markdown 并下载图片到本地。
+> ⚠️ **2026-07-30 起老方法失效**：微信关闭了公众号后台「超链接 → 引用其他公众号文章」背后的接口（`appmsg list_ex` 恒返回 `200013 freq control`，后台编辑器里该入口也已消失；同类开源项目 wechat-article-exporter 已因此停止维护）。微信读书网页端的文章列表接口也已废弃（`-2041`），只能拿到最新一篇。
+>
+> **现行方法**：搜狗微信搜索「公众号名 + 主题关键词」→ 还原文章链接 → 下载全文与图片。老脚本（`scrape.py` / `download_full.py`）保留作存档，不再使用。
 
-适用场景：行业研究 / 内容收藏 / 离线归档 (≤ 10 个目标号)。
-不适用场景：抓取阅读量、点赞、在看（这些数据微信只对号主开放，需走逆向抓包或第三方付费 API）。
+适用场景：行业研究 / 内容收藏 / 离线归档，按主题收集某个号的历史文章。
+不适用：一次性拉取某个号的**全部**文章列表（现在没有公开途径）；阅读量、点赞、在看等数据。
+
+## 关键经验（实测）
+
+| 搜索方式 | 命中率 |
+| --- | --- |
+| 只搜公众号名（如"菜花来了"） | **约 1%**——搜狗搜的是正文提及，账号自己的文章被别人的转载、引用淹没 |
+| 公众号名 + 主题词（如"菜花来了 税"） | **接近 100%** |
+
+- 每个查询最多 10 页（约 100 条），**要用一组关键词覆盖**；先放一个宽泛的主题词（该号最常写的领域），再加细分词
+- 搜狗有防爬：连续请求十几次就可能出验证码。请求间隔 25–35 秒，遇到验证码暂停（默认 2 小时）后重试，**不做任何验证码绕过**
 
 ## 前置条件
 
-```bash
-pip3 install playwright requests beautifulsoup4 markdownify lxml
-playwright install chromium
-```
-
-**你必须有自己的微信公众号**（订阅号免费注册即可），首次运行会弹出浏览器，用微信扫码登录到 mp.weixin.qq.com。登录态保存在 `~/.mp-data-browser/`。
+Python 3.9+，**无第三方依赖**，不需要公众号账号，不需要扫码。
 
 ## 使用方式
 
 ```bash
-/抓订阅公众号 "极客公园"                       # 抓单个号的全量历史
-/抓订阅公众号 "极客公园" --since 2025-01-01    # 只抓某日期之后的文章（增量）
-/抓订阅公众号 --add "极客公园"                 # 添加目标号到配置（不抓取）
-/抓订阅公众号 --list                          # 列出已配置的目标号
-/抓订阅公众号 --all                           # 抓配置里所有号（自动跳过已抓的）
-```
-
-## 输出结构
-
-```
-~/wechat-archive/
-├── <公众号A>/
-│   ├── INDEX.md                              # 索引（按时间倒序，可点击跳转）
-│   ├── 2025-04-20_文章标题/
-│   │   ├── article.md                        # 正文 Markdown
-│   │   ├── metadata.json                     # 元数据（链接、发布时间、摘要等）
-│   │   └── images/
-│   │       ├── 01.jpg
-│   │       └── 02.jpg
-│   └── 2025-04-15_另一篇标题/
-│       └── ...
-└── <公众号B>/...
+/抓订阅公众号 "菜花来了" --keywords 税,股权,社保
 ```
 
 ## 执行流程
 
-### Step 1: 解析参数
+### Step 1：确定关键词
 
-读取 `--add / --list / --all / --since` 等开关，决定执行路径。
+1. 先了解目标号写什么（简介、用户说明），挑 1 个宽泛主题词 + 若干细分词，越靠前越优先
+2. 可以先用宽泛词跑 1 页看命中率（输出里会显示"其中本号 X 条"），命中率低就换词
 
-### Step 2: 登录到自己的公众号后台
-
-```bash
-python3 ~/.claude/skills/mp-data/scripts/scrape.py "<目标公众号名>" [--since YYYY-MM-DD]
-```
-
-1. Playwright 启动 Chromium，加载 `~/.mp-data-browser/` 持久化用户目录
-2. 打开 `https://mp.weixin.qq.com/`
-3. 已登录 → 自动提取 token；未登录 → 等待扫码（最长 3 分钟）
-
-### Step 3: 搜索目标公众号 → 拿 fakeid
-
-调用接口：
-```
-GET https://mp.weixin.qq.com/cgi-bin/searchbiz
-    ?action=search_biz&begin=0&count=5&query=<目标名>
-    &token=<token>&lang=zh_CN&f=json&ajax=1
-```
-
-返回候选列表，自动取第一个匹配的 `fakeid`。如果有多个同名号，会列出让用户确认。
-
-### Step 4: 分页拉取文章列表
-
-```
-GET https://mp.weixin.qq.com/cgi-bin/appmsg
-    ?action=list_ex&begin=<begin>&count=5&fakeid=<fakeid>&type=9
-    &query=&token=<token>&lang=zh_CN&f=json&ajax=1
-```
-
-每页返回 5 篇，循环直到 `app_msg_list` 为空或 `--since` 截止日期之前。
-
-每篇包含：`aid` / `title` / `link` / `digest` / `cover` / `create_time` / `update_time`。
-
-**频率限制**：mp 后台对 `appmsg` 接口有约 100 次/小时的限制，触发后脚本会等待 60 秒重试。
-
-列表保存到 `~/wechat-archive/<公众号>/_list.json`。
-
-### Step 5: 逐篇下载全文
+### Step 2：采集
 
 ```bash
-python3 ~/.claude/skills/mp-data/scripts/download_full.py "<公众号名>"
+python3 ~/.claude/skills/mp-data/scripts/sogou_collect.py "<公众号名>" --keywords <词1>,<词2>,... [--max-requests 300]
 ```
 
-对 `_list.json` 中每篇文章：
-1. 检查目录是否已存在 → 已存在则跳过（增量友好）
-2. `requests.get(link)` 拉公开 HTML（不需要登录）
-3. BeautifulSoup 解析 `#js_content`
-4. markdownify 转为 Markdown
-5. 提取所有 `img[data-src]` 图片，下载到 `images/`
-6. 替换 Markdown 里的图片引用为本地相对路径
-7. 写 `article.md` + `metadata.json`
+对每个关键词逐页：
+1. 搜狗文章搜索 `公众号名 关键词`，只保留署名与目标号完全一致的结果
+2. 还原搜狗跳转链接（临时链接，需立即使用）→ 下载文章页
+3. 校验作者（署名或 `__biz`）→ 写 `article.md` + `metadata.json` + `images/`
+4. 按 `__biz + mid + idx` 去重：同一篇被多个关键词搜到只下载一次；老方法已抓的文章也会被识别跳过
 
-**频率限制**：每篇间隔 2 秒，避免触发反爬。
+可断点续跑：状态在 `~/wechat-archive/<公众号>/_sogou_state.sqlite`，已完成的页和已下载的文章不会重复请求。跑一整套关键词通常要几小时，长时间运行建议：
 
-### Step 6: 生成索引
+```bash
+nohup caffeinate -i python3 ~/.claude/skills/mp-data/scripts/sogou_collect.py "<公众号名>" --keywords ... > ~/wechat-archive/<公众号名>.log 2>&1 &
+```
+
+### Step 3：生成索引
 
 ```bash
 python3 ~/.claude/skills/mp-data/scripts/build_index.py "<公众号名>"
 ```
 
-读取该公众号目录下所有 `metadata.json`，按发布时间倒序生成 `INDEX.md`，每条包含：
-- 标题（点击跳转到 `article.md`）
-- 发布日期
-- 摘要前 100 字
+## 输出结构（与老方法一致）
+
+```
+~/wechat-archive/
+└── <公众号>/
+    ├── INDEX.md                      # 索引（build_index.py 生成）
+    ├── _sogou_state.sqlite           # 断点状态
+    └── 2025-04-20_文章标题/
+        ├── article.md                # 正文 Markdown（图片已改为本地引用）
+        ├── metadata.json             # 标题、永久链接、发布时间、作者、命中关键词等
+        └── images/01.jpg ...
+```
+
+## 新文章跟踪（可选）
+
+微信读书网页端 `GET https://weread.qq.com/api/mp/cover?bookId=MP_WXS_<__biz 解码后的数字>` 可返回某号**最新一篇**（需微信读书登录 Cookie，并先把该号加入书架），全文用公开链接 `https://mp.weixin.qq.com/s/<reviewId 末段>` 下载。适合定时跟踪新文章，不能补历史。
 
 ## 故障排除
 
-- **扫码超时**：重新运行命令
-- **token 失效**：删除 `~/.mp-data-browser/` 重新登录
-- **频率限制 (`freq control`)**：脚本自动等待重试，如频繁触发，建议第二天再跑
-- **搜索不到目标号**：mp 后台的搜索是模糊匹配，尝试更精确的名字或带备案号关键词
-- **某篇文章下载失败**：可能是该文章被作者删除或违规屏蔽，跳过即可
-- **图片下载失败**：微信图床偶有限流，重新跑该号会跳过已下载的、补抓失败的
+- **出现验证码**：脚本会自动暂停后重试；连续多次则结束本次运行，过几个小时重跑同一命令即可从断点继续
+- **命中率很低**：换更贴近该号主题的关键词；确认公众号名与文章署名完全一致
+- **某篇下载失败 / 作者不符**：文章被删、被屏蔽，或同名不同号，跳过即可
+- **图片下载失败**：微信图床偶有限流，不影响正文
 
 ## 文件结构
 
@@ -133,19 +94,18 @@ python3 ~/.claude/skills/mp-data/scripts/build_index.py "<公众号名>"
 mp-data/
 ├── SKILL.md
 ├── scripts/
-│   ├── scrape.py          # 登录 + 搜索 + 拉文章列表
-│   ├── download_full.py   # 下载全文 HTML → Markdown + 图片
+│   ├── sogou_collect.py   # 现行：搜狗「名字 + 关键词」采集（标准库）
 │   ├── build_index.py     # 生成 INDEX.md
-│   └── config.py          # 配置管理（目标号列表）
+│   ├── config.py          # 归档目录配置
+│   ├── scrape.py          # 已失效（2026-07-30）：公众号后台引用接口
+│   ├── download_full.py   # 已失效（依赖 scrape.py 的列表）
+│   └── test_login.py      # 已失效
 ```
 
 ## 配置文件
 
-`~/.config/抓订阅公众号/config.json`
+`~/.config/抓订阅公众号/config.json`（可选，用于修改归档目录）
 
 ```json
-{
-  "targets": ["极客公园", "晚点LatePost"],
-  "archive_dir": "~/wechat-archive"
-}
+{ "archive_dir": "~/wechat-archive" }
 ```
