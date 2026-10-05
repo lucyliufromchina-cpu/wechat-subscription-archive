@@ -35,3 +35,8 @@ _list.json
 # 测试/调试输出
 /tmp_output/
 *.log
+
+# 文章样本涉及版权，不随仓库分发（本地放一份即可让完整测试跑起来）
+scripts/tests/fixtures/wx_article_sample.html
+_logs/
+*.sqlite
