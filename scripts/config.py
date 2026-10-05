@@ -9,7 +9,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "抓订阅公众号"
 CONFIG_PATH = CONFIG_DIR / "config.json"
-ACCOUNTS_PATH = CONFIG_DIR / "accounts.json"  # 公众号清单：名字 + __biz + 搜狗关键词（模板见 scripts/accounts.example.json）
+ACCOUNTS_PATH = CONFIG_DIR / "accounts.json"  # 公众号清单：名字 + __biz（模板见 scripts/accounts.example.json）
 DEFAULT_ARCHIVE_DIR = Path.home() / "wechat-archive"
 
 

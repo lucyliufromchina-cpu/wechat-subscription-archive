@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import unittest
 
-import wechat_sogou as ws
+import wechat_article as ws
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -12,36 +12,6 @@ FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 def _read(name):
     with open(os.path.join(FIX, name), encoding="utf-8", errors="ignore") as f:
         return f.read()
-
-
-class TestParseSearch(unittest.TestCase):
-    def test_rows(self):
-        rows = ws.parse_search(_read("sogou_search_sample.html"))
-        self.assertEqual(len(rows), 8)
-        first = rows[0]
-        self.assertEqual(first["account"], "菜花来了")
-        self.assertEqual(first["title"], "自古“忠义”难两全 —— 也评鲁南制药股权争议")
-        self.assertEqual(first["ts"], 1627459777)
-        self.assertTrue(first["link"].startswith("/link?url="))
-        self.assertNotIn("&amp;", first["link"])
-
-    def test_captcha_detection(self):
-        self.assertTrue(ws.is_captcha('<form action="/antispider/thank.php">'))
-        self.assertFalse(ws.is_captcha(_read("sogou_search_sample.html")))
-
-
-class TestResolveLink(unittest.TestCase):
-    def test_js_concatenation(self):
-        page = """<script>var url = '';
-            url += 'https://mp.';
-            url += 'weixin.qq.c';
-            url += 'om/s?src=11&timest@amp=1&sig@nature=abc';
-            url.replace("@", "");
-            window.location.replace(url)</script>"""
-        self.assertEqual(ws.resolve_sogou_redirect(page), "https://mp.weixin.qq.com/s?src=11&timestamp=1&signature=abc")
-
-    def test_no_url(self):
-        self.assertIsNone(ws.resolve_sogou_redirect("<html></html>"))
 
 
 ARTICLE_FIX = os.path.exists(os.path.join(FIX, "wx_article_sample.html"))  # 文章样本涉及版权，不随仓库分发
@@ -83,7 +53,7 @@ class TestParseArticle(unittest.TestCase):
 @unittest.skipUnless(ARTICLE_FIX, "需要本地文章样本")
 class TestNoSn(unittest.TestCase):
     def test_page_without_sn_has_no_perm_url(self):
-        # 搜狗临时签名链接打开的页面里 sn 为空，拼出的链接会"参数错误"，必须留空
+        # sn 为空的页面拼出的链接会"参数错误"，必须留空
         html = _read("wx_article_sample.html").replace(
             'var sn = "e54c7f021301e9ad14054b2f3f8eb9dc"', 'var sn = ""')
         a = ws.parse_article(html)

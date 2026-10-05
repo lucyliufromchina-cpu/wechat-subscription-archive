@@ -1,12 +1,12 @@
 """按链接下载公众号文章：剪贴板监听 / 链接文件批量。
 
-单篇公众号文章页是公开的，按链接直接下载不经过搜狗，不受其频率限制。
+单篇公众号文章页是公开的，按链接直接下载。
 最省事的用法：在电脑版微信里逐篇右键「复制链接」，本工具自动发现并下载。
 
     python3 scripts/wechat_links.py watch            # 监听剪贴板（Ctrl+C 结束）
     python3 scripts/wechat_links.py file links.txt   # 批量下载文件里的链接（一行一个或混在文字里都行）
 
-文章按署名自动归到 <归档目录>/<公众号>/，与搜狗采集共用去重库（按 __biz+mid+idx），重复的跳过。
+文章按署名自动归到 <归档目录>/<公众号>/，共用去重库（按 __biz+mid+idx），重复的跳过。
 复制自微信客户端的链接带 sn，能生成可打开的永久链接。
 """
 
@@ -23,7 +23,7 @@ from html import unescape
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wechat_sniff as sn  # noqa: E402
-import wechat_sogou as ws  # noqa: E402
+import wechat_article as ws  # noqa: E402
 
 LINK_RE = re.compile(r"https?://mp\.weixin\.qq\.com/s(?:/[A-Za-z0-9_-]+|\?[^\s\"'<>#]+)")
 LINKS_LOG = os.path.join(ws.RAW_DIR, "_copied_links.txt")
@@ -65,7 +65,7 @@ def internal_links(html, bizset):
 
 
 def _save(art, raw, fetcher, store, images, source):
-    d = ws.save_article(art["nickname"], art, raw, fetcher, "", images)
+    d = ws.save_article(art["nickname"], art, raw, fetcher, images, source)
     store.exec("INSERT OR REPLACE INTO articles VALUES (?,?,?,?,?,?,?,?,?)",
                (art["key"], art["nickname"], art["title"], art["ts"], art["perm_url"],
                 os.path.relpath(d, ws.RAW_DIR), source, "", ws.now_iso()))
@@ -232,7 +232,7 @@ def from_file(path, images=True):
 
 def expand(max_new=300, images=True):
     """顺藤摸瓜：从已存文章里找同号其他文章的完整链接，下载后继续找，直到没有新链接或达到上限。
-    只访问公开文章页（不经搜狗），间隔沿用 mp.weixin.qq.com 的 3–5 秒。"""
+    只访问公开文章页，间隔沿用 mp.weixin.qq.com 的 3–5 秒。"""
     cfg = ws.load_config()
     bizset = {a["biz"] for a in cfg["accounts"] if a.get("biz")}
     names = [a["name"] for a in cfg["accounts"]]
@@ -523,24 +523,14 @@ def write_progress(store, last_status):
         f.write("\n".join(lines) + "\n")
 
 
-def _sogou_step(budget=20):
-    """搜狗关键词补老文章：每轮只发少量请求；遇验证码 / 微信验证立即返回，不在这里等待。"""
-    try:
-        ws.run(None, budget=budget, cooldown=0, max_cooldowns=0)
-        return "done"
-    except Exception as e:  # noqa: BLE001
-        print("搜狗步骤出错：%s" % e, flush=True)
-        return "error"
-
-
 def auto(interval=2700, images=True):
-    """循环：合集 → 顺藤摸瓜 → 外部链接 → 搜狗补老文章；遇到微信验证就跳过本轮剩余步骤，等下一轮。"""
+    """循环：合集 → 顺藤摸瓜 → 外部链接；遇到微信验证就跳过本轮剩余步骤，等下一轮。"""
     ws.setup_logging()
     while True:
         started = datetime.now().strftime("%H:%M")
         status = []
         for name, step in (("合集", lambda: albums(500, images)), ("顺藤摸瓜", lambda: expand(500, images)),
-                           ("外部链接", lambda: external(images)), ("搜狗", _sogou_step)):
+                           ("外部链接", lambda: external(images))):
             print("=== [%s] %s" % (started, name), flush=True)
             try:
                 r = step()

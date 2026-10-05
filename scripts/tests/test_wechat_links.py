@@ -21,7 +21,7 @@ class TestExtractLinks(unittest.TestCase):
                          ["https://mp.weixin.qq.com/s?__biz=A&mid=1&idx=1&sn=z"])
 
     def test_ignores_other_urls(self):
-        self.assertEqual(wl.extract_links("https://weixin.sogou.com/link?url=x https://example.com"), [])
+        self.assertEqual(wl.extract_links("https://weixin.qq.com/link?url=x https://example.com"), [])
 
 
 class TestInternalLinks(unittest.TestCase):
@@ -47,14 +47,14 @@ class TestInternalLinks(unittest.TestCase):
 class TestVerifyPage(unittest.TestCase):
     def test_detects_wechat_verification_page(self):
         import os
-        import wechat_sogou as ws
+        import wechat_article as ws
         fix = os.path.join(os.path.dirname(__file__), "fixtures")
         with open(os.path.join(fix, "wx_verify_page.html"), encoding="utf-8") as f:
             self.assertTrue(ws.is_wechat_verify(f.read()))
         self.assertFalse(ws.is_wechat_verify("<html><div id=\"js_content\">正文</div></html>"))
 
     def test_article_interval_is_gentle(self):
-        import wechat_sogou as ws
+        import wechat_article as ws
         self.assertGreaterEqual(ws.INTERVALS["mp.weixin.qq.com"][0], 8)
 
 

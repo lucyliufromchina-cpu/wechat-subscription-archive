@@ -1,13 +1,13 @@
 ---
 name: 抓订阅公众号
-description: 把你订阅的微信公众号的历史文章（标题/链接/发布时间/全文/图片）归档为本地 Markdown。2026-10 起主方法：本机 mitmproxy 旁听微信 Mac 客户端自己打开的文章页并直接落盘（不伪造请求、不绕过验证码），配合合集页、顺藤摸瓜、搜狗关键词三种补充手段。Python 标准库 + mitmproxy。
+description: 把你订阅的微信公众号的历史文章（标题/链接/发布时间/全文/图片）归档为本地 Markdown。2026-10 起主方法：本机 mitmproxy 旁听微信 Mac 客户端自己打开的文章页并直接落盘（不伪造请求、不绕过验证码），配合合集页、顺藤摸瓜两种补充手段。Python 标准库 + mitmproxy。
 trigger: /抓订阅公众号
 ---
 
 # 抓订阅公众号 Skill
 
 > **2026-10 现状**：公众号后台「引用文章」接口（7-30 关闭）、微信读书列表接口、Windows 工具链依赖的凭证回放（9 月起返回空）都已不可用；
-> 搜索引擎不收录公众号文章；搜狗只能按关键词碰、且有验证码。微信 Mac 4.1.x 的公众号主页虽是网页，但文章**列表**由客户端通过内部通道取回，HTTP 层看不到。
+> 搜索引擎不收录公众号文章；搜狗只能按关键词碰、验证码频繁，已弃用。微信 Mac 4.1.x 的公众号主页虽是网页，但文章**列表**由客户端通过内部通道取回，HTTP 层看不到。
 > **唯一还能稳定拿到的是"客户端打开的那篇文章"**——本 skill 就建立在这一点上。
 
 适用：行业研究 / 内容收藏 / 离线归档。不适用：一次性拉某号全部列表（没有公开途径）、阅读量等互动数据。
@@ -19,9 +19,8 @@ trigger: /抓订阅公众号
 | **A 直存（主）** | 微信客户端打开文章 → 本机 mitmproxy 旁听响应 → 整页落盘入库 | 任何你点开的文章，全文 + 图片，不触发微信验证 | 每篇要点一次（人或 Codex） |
 | B 合集 | 公众号「合集」页免登录可翻 | 作者归入合集的文章 | 只覆盖有合集的 |
 | C 顺藤摸瓜 | 从已存文章里找同号链接继续下载 | 往期推荐、系列文 | 程序直连文章页，频繁会被微信要求验证 |
-| D 搜狗关键词 | 「公众号名 + 主题词」检索 | 按主题碰老文章 | 每词 10 页；验证码即停 |
 
-B / C / D 由 `auto` 循环自动跑；A 需要有人在微信里点。
+B / C 由 `auto` 循环自动跑；A 需要有人在微信里点。
 
 ## 边界（不做的事）
 
@@ -67,15 +66,15 @@ python3 scripts/wechat_links.py sniffed
 
 只有 `<归档目录>/_logs/wechat_sniff.out` 里出现 `📄 正文页 …`、消费端出现 `✅`，才算抓到。鼠标脚本打印 completed、队列没动，就是代理或锁屏出了问题。
 
-## 补充流程 B/C/D：自动循环
+## 补充流程 B/C：自动循环
 
 ```bash
 nohup caffeinate -i python3 scripts/wechat_links.py auto > ~/wechat-archive/_logs/auto.out 2>&1 &
 ```
 
-每轮：合集 → 顺藤摸瓜 → 外部链接（其它号文章 / 网页 / PDF，只追一层）→ 搜狗补老文章；任一步遇微信验证就跳过本轮剩余，45 分钟后再来。进度写在 `<归档目录>/_进度.md`。
+每轮：合集 → 顺藤摸瓜 → 外部链接（其它号文章 / 网页 / PDF，只追一层）；任一步遇微信验证就跳过本轮剩余，45 分钟后再来。进度写在 `<归档目录>/_进度.md`。
 
-单独跑：`python3 scripts/wechat_links.py albums|expand|external`、`python3 scripts/wechat_sogou.py run [--account <公众号名>]`、`python3 scripts/wechat_links.py file <含链接的文本>`、`python3 scripts/wechat_links.py watch`（剪贴板监听，老方法，仍可用）。
+单独跑：`python3 scripts/wechat_links.py albums|expand|external`、`python3 scripts/wechat_article.py stats`、`python3 scripts/wechat_links.py file <含链接的文本>`、`python3 scripts/wechat_links.py watch`（剪贴板监听，老方法，仍可用）。
 
 ## 输出结构
 
@@ -109,7 +108,7 @@ mp-data/
 └── scripts/
     ├── wechat_sniff.py             # mitmproxy addon：旁听、落盘、白名单
     ├── wechat_links.py             # sniffed / watch / file / albums / expand / external / auto
-    ├── wechat_sogou.py             # 搜狗关键词采集 + 文章解析 + 存储（被前两者复用）
+    ├── wechat_article.py           # 文章解析 + 下载节奏 + 去重库 / 落盘（被前两者复用）
     ├── config.py                   # 归档目录 / 清单路径
     ├── accounts.example.json       # 公众号清单模板
     ├── build_index.py              # 旧索引生成器（INDEX.md），可选

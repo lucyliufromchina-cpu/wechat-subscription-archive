@@ -1,25 +1,20 @@
-"""公众号历史文章采集：搜狗微信搜索（公众号名 + 主题关键词）→ 还原文章链接 → 下载全文。
+"""公众号文章：解析（parse_article）、下载节奏（Fetcher）、去重库与落盘（Store / save_article）。
 
-背景：微信 2026-07-30 关闭了公众号后台"引用其他公众号文章"接口；微信读书网页端也只给最新一篇。
-搜狗微信搜索按"公众号名 + 关键词"检索命中率高，但每个关键词最多 10 页，且有防爬验证码。
+被 wechat_links.py（直存 / 合集 / 顺藤摸瓜 / 外链）和 wechat_sniff.py 复用。
 
-用法（skill 目录）：
-    python3 scripts/wechat_sogou.py run                      # 按关键词清单采集全部公众号
-    python3 scripts/wechat_sogou.py run --account <公众号名>    # 只采一个号
-    python3 scripts/wechat_sogou.py import-local --src ~/wechat-archive/<公众号名> --account <公众号名>
-    python3 scripts/wechat_sogou.py stats
+    python3 scripts/wechat_article.py stats
+    python3 scripts/wechat_article.py import-local --src <旧归档目录> --account <公众号名>
 
-关键词清单：~/.config/抓订阅公众号/accounts.json
+公众号清单：~/.config/抓订阅公众号/accounts.json（name + __biz）
 数据落地：<归档目录>/<公众号>/<日期>_<标题>/{article.md, metadata.json, source.html, images/}
-采集状态：<归档目录>/wechat.sqlite（断点续跑：已完成的页、已下载的文章都不会重复请求）
+去重库：<归档目录>/wechat.sqlite（按 __biz+mid+idx）
 
-礼貌与边界：搜狗请求间隔 ≥ 25 秒；遇到验证码立即暂停，冷却后再试，**不做任何验证码绕过**。
+边界：程序直连文章页间隔 ≥ 8 秒；遇微信"环境异常"验证页立即停止，**不做任何绕过**。
 """
 
 import argparse
 import csv
 import hashlib
-import http.cookiejar
 import json
 import logging
 import os
@@ -42,22 +37,14 @@ RAW_DIR = str(get_archive_dir())        # 归档目录（默认 ~/wechat-archive
 ROOT = RAW_DIR
 DB_PATH = os.path.join(RAW_DIR, "wechat.sqlite")
 INDEX_CSV = os.path.join(RAW_DIR, "INDEX.csv")
-COOKIE_PATH = os.path.join(RAW_DIR, "_sogou_cookies.txt")
-LOCK_PATH = os.path.join(RAW_DIR, "_wechat.lock")
-KEYWORDS_PATH = str(ACCOUNTS_PATH)      # 公众号清单：名字 + __biz + 搜狗关键词
+KEYWORDS_PATH = str(ACCOUNTS_PATH)      # 公众号清单：名字 + __biz
 LOG_DIR = os.path.join(RAW_DIR, "_logs")
 
-SOGOU = "https://weixin.sogou.com"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-MAX_PAGES = 10  # 搜狗每个查询最多 10 页
-INTERVALS = {"weixin.sogou.com": (25, 10), "mp.weixin.qq.com": (8, 4), "mmbiz.qpic.cn": (0.5, 0.5)}
+INTERVALS = {"mp.weixin.qq.com": (8, 4), "mmbiz.qpic.cn": (0.5, 0.5)}  # 基础间隔秒 + 随机抖动
 
-log = logging.getLogger("wechat_sogou")
-
-
-class Captcha(Exception):
-    pass
+log = logging.getLogger("wechat_article")
 
 
 class WechatVerify(Exception):
@@ -67,33 +54,8 @@ class WechatVerify(Exception):
 # ---------------------------------------------------------------- 解析
 
 
-def _clean(s):
-    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", "", s or ""))).strip()
-
-
-_ROW_RE = re.compile(
-    r'<h3>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>\s*</h3>.*?'
-    r'<span class="all-time-y2">(.*?)</span>.*?timeConvert\(\'(\d+)\'\)', re.S)
-
-
-def parse_search(html):
-    """搜狗文章搜索结果：[{title, account, ts, link}]（link 为 /link?url=... 跳转地址）。"""
-    return [{"link": unescape(link), "title": _clean(title), "account": _clean(acc), "ts": int(ts)}
-            for link, title, acc, ts in _ROW_RE.findall(html)]
-
-
 def is_wechat_verify(html):
     return "secitptpage/verify" in html
-
-
-def is_captcha(html):
-    return "antispider" in html or "请输入验证码" in html or "seccodeImage" in html
-
-
-def resolve_sogou_redirect(page):
-    """跳转页用 JS 分段拼接真实地址（url += '...'; url.replace("@", "")）。"""
-    parts = re.findall(r"url \+= '([^']*)'", page)
-    return "".join(parts).replace("@", "") if parts else None
 
 
 def _var(html, name, pattern=r'"([^"]+)"'):
@@ -177,7 +139,7 @@ def parse_article(html):
     ts = _var(html, "ct", r'"(\d{10})"')
     p = _ContentParser()
     p.feed(html)
-    perm = "https://mp.weixin.qq.com/s?__biz=%s&mid=%s&idx=%s&sn=%s" % (biz, mid, idx, sn) if biz and mid and sn else ""  # 搜狗临时签名链接的页面不含 sn，拼不出可用的永久链接
+    perm = "https://mp.weixin.qq.com/s?__biz=%s&mid=%s&idx=%s&sn=%s" % (biz, mid, idx, sn) if biz and mid and sn else ""  # 缺 sn 的页面拼不出可用的永久链接（会"参数错误"），宁可留空
     return {
         "title": unescape(title_m.group(1)) if title_m else "",
         "nickname": unescape(nick),
@@ -202,15 +164,8 @@ def safe_name(s, maxlen=60):
 class Fetcher:
     def __init__(self):
         os.makedirs(RAW_DIR, exist_ok=True)
-        self.jar = http.cookiejar.MozillaCookieJar(COOKIE_PATH)
-        if os.path.exists(COOKIE_PATH):
-            try:
-                self.jar.load(ignore_discard=True, ignore_expires=True)
-            except Exception:  # noqa: BLE001 — cookie 文件损坏就当没有
-                pass
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+        self.opener = urllib.request.build_opener()
         self.last = {}
-        self.sogou_requests = 0
 
     def get(self, url, referer=None, binary=False):
         url = urllib.parse.quote(url, safe=":/?&=%#+,;@!$'()*[]~")
@@ -225,14 +180,9 @@ class Fetcher:
             headers["Referer"] = referer
         with self.opener.open(urllib.request.Request(url, headers=headers), timeout=30) as resp:
             final_url, data = resp.geturl(), resp.read()
-        if host.endswith("weixin.sogou.com"):
-            self.sogou_requests += 1
-            self.jar.save(ignore_discard=True, ignore_expires=True)
         if binary:
             return data
         text = data.decode("utf-8", errors="ignore")
-        if "antispider" in final_url or (host.endswith("sogou.com") and is_captcha(text)):
-            raise Captcha(final_url)
         if host.endswith("mp.weixin.qq.com") and is_wechat_verify(text):
             raise WechatVerify(final_url)
         return text
@@ -246,9 +196,6 @@ CREATE TABLE IF NOT EXISTS articles (key TEXT PRIMARY KEY, account TEXT, title T
     perm_url TEXT, dir TEXT, source TEXT, keyword TEXT, fetched_at TEXT);
 CREATE TABLE IF NOT EXISTS seen (account TEXT, title TEXT, ts INTEGER, key TEXT,
     PRIMARY KEY (account, title, ts));
-CREATE TABLE IF NOT EXISTS pages (account TEXT, keyword TEXT, page INTEGER, rows INTEGER, hits INTEGER,
-    done_at TEXT, PRIMARY KEY (account, keyword, page));
-CREATE TABLE IF NOT EXISTS keywords_done (account TEXT, keyword TEXT, done_at TEXT, PRIMARY KEY (account, keyword));
 """
 
 
@@ -275,14 +222,8 @@ class Store:
     def seen(self, account, title, ts):
         return self.one("SELECT 1 FROM seen WHERE account=? AND title=? AND ts=?", (account, title, ts)) is not None
 
-    def page_done(self, account, kw, page):
-        return self.one("SELECT 1 FROM pages WHERE account=? AND keyword=? AND page=?", (account, kw, page)) is not None
 
-    def keyword_done(self, account, kw):
-        return self.one("SELECT 1 FROM keywords_done WHERE account=? AND keyword=?", (account, kw)) is not None
-
-
-def save_article(account, art, raw_html, fetcher, keyword, images=True):
+def save_article(account, art, raw_html, fetcher, images=True, source="link"):
     date = datetime.fromtimestamp(art["ts"]).strftime("%Y-%m-%d") if art["ts"] else "unknown"
     d = os.path.join(RAW_DIR, account, "%s_%s" % (date, safe_name(art["title"] or art["key"])))
     os.makedirs(d, exist_ok=True)
@@ -302,8 +243,8 @@ def save_article(account, art, raw_html, fetcher, keyword, images=True):
             except Exception as e:  # noqa: BLE001 — 单张图片失败不影响正文
                 img_records.append({"file": "images/" + fname, "url": url, "error": str(e)[:200]})
     meta = {k: art[k] for k in ("title", "nickname", "biz", "mid", "idx", "sn", "key", "perm_url", "ts")}
-    meta.update({"account": account, "publish_date": date, "keyword": keyword, "fetched_at": now_iso(),
-                 "source": "sogou", "images": img_records,
+    meta.update({"account": account, "publish_date": date, "fetched_at": now_iso(),
+                 "source": source, "images": img_records,
                  "text_sha256": hashlib.sha256(art["text"].encode("utf-8")).hexdigest()})
     with open(os.path.join(d, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -324,79 +265,6 @@ def load_config():
         return json.load(f)
 
 
-def collect_keyword(fetcher, store, acc, kw, images, budget):
-    name = acc["name"]
-    query = ("%s %s" % (name, kw)).strip()
-    for page in range(1, MAX_PAGES + 1):
-        if store.page_done(name, kw, page):
-            continue
-        if fetcher.sogou_requests >= budget:
-            return False
-        search_url = "%s/weixin?type=2&page=%d&query=%s" % (SOGOU, page, urllib.parse.quote(query))
-        rows = parse_search(fetcher.get(search_url, referer=SOGOU + "/"))
-        if not rows:
-            log.info("[%s] 「%s」第 %d 页无结果，关键词完成", name, query, page)
-            break
-        hits = 0
-        for row in rows:
-            if row["account"] != name or store.seen(name, row["title"], row["ts"]):
-                continue
-            url = resolve_sogou_redirect(fetcher.get(SOGOU + row["link"], referer=search_url))
-            if not url:
-                log.warning("[%s] 跳转链接解析失败：%s", name, row["title"])
-                continue
-            raw = fetcher.get(url)
-            art = parse_article(raw)
-            if art["nickname"] != name and art["biz"] != acc.get("biz"):
-                log.warning("[%s] 作者不符（%s），跳过：%s", name, art["nickname"], row["title"])
-                continue
-            if art["key"] and not store.has_article(art["key"]):
-                d = save_article(name, art, raw, fetcher, kw, images)
-                store.exec("INSERT OR REPLACE INTO articles VALUES (?,?,?,?,?,?,?,?,?)",
-                           (art["key"], name, art["title"], art["ts"], art["perm_url"],
-                            os.path.relpath(d, RAW_DIR), "sogou", kw, now_iso()))
-                hits += 1
-                log.info("[%s] + %s %s", name, datetime.fromtimestamp(art["ts"]).date() if art["ts"] else "?",
-                         art["title"])
-            store.exec("INSERT OR IGNORE INTO seen VALUES (?,?,?,?)", (name, row["title"], row["ts"], art["key"]))
-        store.exec("INSERT OR REPLACE INTO pages VALUES (?,?,?,?,?,?)", (name, kw, page, len(rows), hits, now_iso()))
-        log.info("[%s] 「%s」第 %d 页：%d 条结果，新增 %d 篇", name, query, page, len(rows), hits)
-    store.exec("INSERT OR REPLACE INTO keywords_done VALUES (?,?,?)", (name, kw, now_iso()))
-    return True
-
-
-def run(account=None, budget=300, cooldown=7200, max_cooldowns=3, images=True):
-    cfg = load_config()
-    fetcher, store = Fetcher(), Store()
-    cooldowns = 0
-    for acc in cfg["accounts"]:
-        if account and acc["name"] != account:
-            continue
-        for kw in acc["keywords"]:
-            if store.keyword_done(acc["name"], kw):
-                continue
-            while True:
-                try:
-                    finished = collect_keyword(fetcher, store, acc, kw, images, budget)
-                    break
-                except (Captcha, WechatVerify) as e:
-                    cooldowns += 1
-                    if cooldowns > max_cooldowns:
-                        log.warning("验证码已出现 %d 次，本次运行结束；稍后重跑会从断点继续", cooldowns)
-                        write_index(store)
-                        return
-                    log.warning("遇到%s，暂停 %d 分钟后重试（第 %d/%d 次）",
-                                "微信验证页" if isinstance(e, WechatVerify) else "搜狗验证码",
-                                cooldown // 60, cooldowns, max_cooldowns)
-                    time.sleep(cooldown)
-            if not finished:
-                log.info("达到本次请求上限 %d，结束；稍后重跑会从断点继续", budget)
-                write_index(store)
-                return
-    write_index(store)
-    log.info("全部关键词完成")
-
-
 def import_local(src, account):
     """把旧版 mp-data 抓取的归档（article.md + metadata.json + images/）导入，并登记去重键。"""
     store = Store()
@@ -411,7 +279,7 @@ def import_local(src, account):
         q = urllib.parse.parse_qs(urllib.parse.urlparse(m.get("link", "")).query)
         biz, mid, idx, sn = (q.get(k, [""])[0] for k in ("__biz", "mid", "idx", "sn"))
         key = "%s_%s_%s" % (biz, mid, idx)
-        if mid:  # 登记"标题 + 发布时间"，搜狗再搜到时连跳转链接都不用还原
+        if mid:  # 登记"标题 + 发布时间"作为第二重去重键
             store.exec("INSERT OR IGNORE INTO seen VALUES (?,?,?,?)",
                        (account, m.get("title", ""), int(m.get("create_time") or 0), key))
         if not mid or store.has_article(key):
@@ -444,23 +312,6 @@ def print_stats():
             "SELECT account, count(*), min(ts), max(ts) FROM articles GROUP BY account"):
         fmt = lambda t: datetime.fromtimestamp(t).strftime("%Y-%m-%d") if t else "?"
         print("%s：%d 篇（%s ～ %s）" % (acc, n, fmt(lo), fmt(hi)))
-    cfg = load_config()
-    for acc in cfg["accounts"]:
-        done = sum(store.keyword_done(acc["name"], k) for k in acc["keywords"])
-        print("%s 关键词进度：%d / %d" % (acc["name"], done, len(acc["keywords"])))
-
-
-def acquire_lock():
-    os.makedirs(RAW_DIR, exist_ok=True)
-    if os.path.exists(LOCK_PATH):
-        try:
-            os.kill(int(open(LOCK_PATH).read().strip() or 0), 0)
-            return False
-        except (ValueError, ProcessLookupError, PermissionError):
-            os.remove(LOCK_PATH)
-    with open(LOCK_PATH, "w") as f:
-        f.write(str(os.getpid()))
-    return True
 
 
 def setup_logging():
@@ -468,20 +319,14 @@ def setup_logging():
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     log.setLevel(logging.INFO)
     for h in (logging.StreamHandler(sys.stdout),
-              logging.FileHandler(os.path.join(LOG_DIR, "wechat_sogou.log"), encoding="utf-8")):
+              logging.FileHandler(os.path.join(LOG_DIR, "wechat_article.log"), encoding="utf-8")):
         h.setFormatter(fmt)
         log.addHandler(h)
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="公众号历史文章采集（搜狗微信搜索）")
+    ap = argparse.ArgumentParser(description="公众号文章归档：统计 / 导入旧归档")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run")
-    r.add_argument("--account")
-    r.add_argument("--max-requests", type=int, default=300, help="本次运行最多发多少次搜狗请求")
-    r.add_argument("--cooldown", type=int, default=7200, help="遇到验证码后暂停秒数")
-    r.add_argument("--max-cooldowns", type=int, default=3)
-    r.add_argument("--no-images", action="store_true")
     i = sub.add_parser("import-local")
     i.add_argument("--src", required=True)
     i.add_argument("--account", required=True)
@@ -489,19 +334,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.cmd == "stats":
         print_stats()
-        return
-    if args.cmd == "import-local":
+    else:
         import_local(args.src, args.account)
-        return
-    setup_logging()
-    if not acquire_lock():
-        log.warning("已有采集进程在运行，本次跳过")
-        return
-    try:
-        run(args.account, args.max_requests, args.cooldown, args.max_cooldowns, not args.no_images)
-    finally:
-        if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
 
 
 if __name__ == "__main__":
